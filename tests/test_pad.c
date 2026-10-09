@@ -31,6 +31,18 @@ int bbgpu_input_reload_requested(void) {
     stub_reload_requested=0;
     return r;
 }
+/* Self-contained wrappers over the production binding pass, for tests that build a HostState
+ * directly and query one output at a time: run the pass for that state, then read it.
+ * sample_host runs evaluate_bindings once per sample and uses the output_* helpers, so these
+ * live here rather than in runtime_pad.c (where -Werror would flag them as unused). */
+static int button_output_held(const HostState *host, const InputConfig *cfg, InputOutput out) {
+    evaluate_bindings(host,cfg);
+    return output_button_held(host,cfg,out);
+}
+static int axis_output_value(const HostState *host, const InputConfig *cfg, InputOutput out, int half_sign) {
+    evaluate_bindings(host,cfg);
+    return output_axis_value(host,cfg,out,half_sign);
+}
 
 static void inject(const char *path, const char *tokens) {
     FILE *f=fopen(path,"w");
@@ -49,7 +61,8 @@ static void test_binding_evaluation(void) {
     input_config_parse(&cfg,
         "cross = j\n"
         "cross = a\n"           /* two bindings on the same output: either fires it (MIX-002) */
-        "axis_left_x_minus = a\n"
+        "axis_left_x_minus = h\n" /* h, not a: a key shared by two bindings is claimed by the
+                                   * first one evaluated (see test_combo_priority) */
         "axis_left_x_plus = d\n"
         "analog_deadzone = leftjoystick, 10, 100\n"
         "leftjoystick_halfmode = lctrl\n");
@@ -66,17 +79,17 @@ static void test_binding_evaluation(void) {
     assert(button_output_held(&host,&cfg,OUT_CROSS));
     keys[SDL_SCANCODE_A]=false;
 
-    /* DZN-001: below inner (10), the stick is 0; a is also axis_left_x_minus, so it is a full
+    /* DZN-001: below inner (10), the stick is 0; h is axis_left_x_minus, so it is a full
      * -127 contribution before the deadzone, which must then clamp it to -127 (well above 100,
      * the outer bound) -- i.e. a full key press always saturates past any sane deadzone. */
     int lx=apply_deadzone(axis_output_value(&host,&cfg,OUT_AXIS_LEFT_X_MINUS,-1)
                           +axis_output_value(&host,&cfg,OUT_AXIS_LEFT_X_PLUS,1),10,100);
-    assert(lx==0); /* a released: no contribution at all */
-    keys[SDL_SCANCODE_A]=true;
+    assert(lx==0); /* h released: no contribution at all */
+    keys[SDL_SCANCODE_H]=true;
     lx=apply_deadzone(axis_output_value(&host,&cfg,OUT_AXIS_LEFT_X_MINUS,-1)
                       +axis_output_value(&host,&cfg,OUT_AXIS_LEFT_X_PLUS,1),10,100);
     assert(lx==-127);
-    keys[SDL_SCANCODE_A]=false;
+    keys[SDL_SCANCODE_H]=false;
 
     /* DZN-001 ramp, exact value: deadzone(60,10,100) = 127*(60-10)/(100-10) = 70. */
     assert(apply_deadzone(60,10,100)==70);
@@ -92,6 +105,106 @@ static void test_binding_evaluation(void) {
     assert(!button_output_held(&host,&cfg,OUT_LEFTJOYSTICK_HALFMODE));
 
     puts("PASS: binding evaluation (remap OR, deadzone ramp and saturation, halfmode binding)");
+}
+
+/* Combo bindings: every source of "r2 = lshift,leftbutton" must be held before the output
+ * fires; releasing either releases the output. This is what makes shadPS4 configs that dodge
+ * on Shift+Right-Click (the author's) work here. */
+static void test_combo_binding_evaluation(void) {
+    InputConfig cfg;
+    input_config_parse(&cfg,
+        "r2 = lshift,leftbutton\n"
+        "r1 = leftbutton\n"          /* plain binding: leftbutton alone still fires R1 */
+        "pad_left = lshift,mousewheeldown\n");
+    assert(cfg.warnings==0);
+
+    bool keys[SDL_SCANCODE_COUNT]={0};
+    HostState host={keys,NULL,0,0};
+    assert(!button_output_held(&host,&cfg,OUT_R2));
+
+    /* The combo needs both halves: neither alone fires it... */
+    keys[SDL_SCANCODE_LSHIFT]=true;
+    assert(!button_output_held(&host,&cfg,OUT_R2));
+    keys[SDL_SCANCODE_LSHIFT]=false;
+    host.mouse_buttons=SDL_BUTTON_MASK(SDL_BUTTON_LEFT);
+    assert(!button_output_held(&host,&cfg,OUT_R2));
+    assert(button_output_held(&host,&cfg,OUT_R1)); /* ...but the plain leftbutton binding does */
+    /* ...and holding both fires it. */
+    keys[SDL_SCANCODE_LSHIFT]=true;
+    assert(button_output_held(&host,&cfg,OUT_R2));
+    /* Releasing either half releases the combo (all sources ANDed). */
+    keys[SDL_SCANCODE_LSHIFT]=false;
+    assert(!button_output_held(&host,&cfg,OUT_R2));
+    host.mouse_buttons=0;
+    assert(!button_output_held(&host,&cfg,OUT_R2));
+
+    /* A key plus a wheel half: the wheel pulse alone does not fire; Shift plus the wheel does. */
+    keys[SDL_SCANCODE_LSHIFT]=true;
+    host.mouse_wheel=0;
+    assert(!button_output_held(&host,&cfg,OUT_PAD_LEFT));
+    host.mouse_wheel=1u<<1; /* WHEEL_DOWN */
+    assert(button_output_held(&host,&cfg,OUT_PAD_LEFT));
+
+    puts("PASS: combo bindings (all sources ANDed; plain bindings kill on their own)");
+}
+
+/* shadPS4's priority/claim rule (input_handler.cpp ProcessBinding): bindings are evaluated
+ * longest-first and a fired binding claims its inputs for that sample, so a combo takes over
+ * from the single-key bindings sharing its keys instead of everything firing at once. Uses the
+ * author's shadPS4 config: "r2 = lshift,leftbutton", "r1 = leftbutton",
+ * "leftjoystick_halfmode = lshift", "pad_left = lshift,mousewheeldown", "pad_down =
+ * mousewheeldown":
+ *   - shift alone      -> halfmode only
+ *   - M1 alone         -> r1 only
+ *   - shift+M1         -> r2 only (r1 and halfmode suppressed for that press)
+ *   - shift+wheel down -> pad_left only (pad_down and halfmode suppressed) */
+static void test_combo_priority(void) {
+    InputConfig cfg;
+    input_config_parse(&cfg,
+        "r2 = lshift,leftbutton\n"
+        "r1 = leftbutton\n"
+        "leftjoystick_halfmode = lshift\n"
+        "pad_left = lshift,mousewheeldown\n"
+        "pad_down = mousewheeldown\n");
+    assert(cfg.warnings==0);
+
+    bool keys[SDL_SCANCODE_COUNT]={0};
+    HostState host={keys,NULL,0,0};
+
+    /* shift alone: only the halfmode single fires (no combo is complete, so nothing is claimed). */
+    keys[SDL_SCANCODE_LSHIFT]=true;
+    assert(button_output_held(&host,&cfg,OUT_LEFTJOYSTICK_HALFMODE));
+    assert(!button_output_held(&host,&cfg,OUT_R2));
+    assert(!button_output_held(&host,&cfg,OUT_R1));
+    keys[SDL_SCANCODE_LSHIFT]=false;
+
+    /* M1 alone: the plain r1 binding fires; the combo is incomplete. */
+    host.mouse_buttons=SDL_BUTTON_MASK(SDL_BUTTON_LEFT);
+    assert(button_output_held(&host,&cfg,OUT_R1));
+    assert(!button_output_held(&host,&cfg,OUT_R2));
+
+    /* shift+M1: the combo fires and claims both keys -- r1 and halfmode stay off. */
+    keys[SDL_SCANCODE_LSHIFT]=true;
+    assert(button_output_held(&host,&cfg,OUT_R2));
+    assert(!button_output_held(&host,&cfg,OUT_R1));
+    assert(!button_output_held(&host,&cfg,OUT_LEFTJOYSTICK_HALFMODE));
+    keys[SDL_SCANCODE_LSHIFT]=false;
+    host.mouse_buttons=0;
+
+    /* shift+wheel down: pad_left fires and claims shift+wheel -- pad_down and halfmode stay off. */
+    keys[SDL_SCANCODE_LSHIFT]=true;
+    host.mouse_wheel=1u<<1; /* WHEEL_DOWN */
+    assert(button_output_held(&host,&cfg,OUT_PAD_LEFT));
+    assert(!button_output_held(&host,&cfg,OUT_PAD_DOWN));
+    assert(!button_output_held(&host,&cfg,OUT_LEFTJOYSTICK_HALFMODE));
+    keys[SDL_SCANCODE_LSHIFT]=false;
+
+    /* wheel down alone: the plain pad_down binding fires again once the combo is not held. */
+    host.mouse_wheel=1u<<1;
+    assert(button_output_held(&host,&cfg,OUT_PAD_DOWN));
+    assert(!button_output_held(&host,&cfg,OUT_PAD_LEFT));
+
+    puts("PASS: combo priority (longest binding claims its inputs; singles yield)");
 }
 
 /* T5: the shadPS4-based mouse formula (CNV-001..003, MOU-009). mouse_to_axis is stateful again
@@ -327,6 +440,8 @@ static void test_reload_on_f8(void) {
 
 int main(void) {
     test_binding_evaluation();
+    test_combo_binding_evaluation();
+    test_combo_priority();
     test_mouse_to_axis();
     test_mouse_buttons_and_wheel();
 

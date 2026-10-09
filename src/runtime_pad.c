@@ -122,73 +122,138 @@ typedef struct {
     uint32_t mouse_wheel;   /* bbgpu_mouse_take's wheel: bit 0 up, 1 down, 2 left, 3 right */
 } HostState;
 
-/* Evaluates one binding against the current host state (MIX-002/003/004): for a button-like
- * binding, 1 if held, 0 otherwise; for an axis-like binding, the signed contribution in axis
- * units (-127..127, OUT_AXIS_LEFT_X etc. included, scaled from the physical stick/trigger).
- * `is_button_output` tells which of the two readings the caller wants (an axis binding on a
- * button-like output, or vice versa, each have their own threshold rule, applied by the
- * caller -- see OUT-004/OUT-005). */
-static int binding_held(const HostState *host, const InputBinding *b) {
-    switch (b->kind) {
-    case IN_KEY: return host->keys && host->keys[b->value];
-    case IN_CBUTTON: return host->gamepad && SDL_GetGamepadButton(host->gamepad,(SDL_GamepadButton)b->value);
+/* True if one input source is currently active. Axis sources use the same thresholds as the
+ * button readings below (OUT-004/OUT-005): a trigger above INPUT_TRIGGER_BUTTON_THRESHOLD, a
+ * half/full stick axis deflected past INPUT_HALF_AXIS_BUTTON_THRESHOLD in its own direction. */
+static int source_active(const HostState *host, const InputSource *s) {
+    switch (s->kind) {
+    case IN_KEY: return host->keys && host->keys[s->value];
+    case IN_CBUTTON: return host->gamepad && SDL_GetGamepadButton(host->gamepad,(SDL_GamepadButton)s->value);
     case IN_AXIS: {
         /* OUT-004: a trigger (l2/r2) bound to a button-like output uses the 0..255 trigger
          * threshold. A full stick axis (axis_left_x etc.) bound to a button-like output is not
          * covered by name in the spec; treated like a half-axis (OUT-005's threshold) since it
          * is the same physical reading, just not split by sign at the binding site. */
         if (!host->gamepad) return 0;
-        int16_t raw=SDL_GetGamepadAxis(host->gamepad,(SDL_GamepadAxis)b->value);
-        if (b->value==SDL_GAMEPAD_AXIS_LEFT_TRIGGER || b->value==SDL_GAMEPAD_AXIS_RIGHT_TRIGGER)
+        int16_t raw=SDL_GetGamepadAxis(host->gamepad,(SDL_GamepadAxis)s->value);
+        if (s->value==SDL_GAMEPAD_AXIS_LEFT_TRIGGER || s->value==SDL_GAMEPAD_AXIS_RIGHT_TRIGGER)
             return trigger(raw)>INPUT_TRIGGER_BUTTON_THRESHOLD;
-        return abs(raw>>8)>INPUT_HALF_AXIS_BUTTON_THRESHOLD;
+        int v=raw>>8; /* -128..127 */
+        return (s->half_sign>0 ? v : -v)>INPUT_HALF_AXIS_BUTTON_THRESHOLD;
     }
     case IN_AXIS_HALF: {
         if (!host->gamepad) return 0;
-        int16_t raw=SDL_GetGamepadAxis(host->gamepad,(SDL_GamepadAxis)b->value);
+        int16_t raw=SDL_GetGamepadAxis(host->gamepad,(SDL_GamepadAxis)s->value);
         int v=raw>>8; /* -128..127 */
-        return b->half_sign>0 ? v>INPUT_HALF_AXIS_BUTTON_THRESHOLD : -v>INPUT_HALF_AXIS_BUTTON_THRESHOLD;
+        return s->half_sign>0 ? v>INPUT_HALF_AXIS_BUTTON_THRESHOLD : -v>INPUT_HALF_AXIS_BUTTON_THRESHOLD;
     }
     /* MOU-006: mouse bindings only ever fire while bbgpu_mouse_take reported captured=1 --
      * enforced by sample_host() zeroing host->mouse_buttons/mouse_wheel outright when not
      * captured, so this function does not need to re-check capture itself. */
-    case IN_MOUSE_BUTTON: return (host->mouse_buttons & SDL_BUTTON_MASK(b->value))!=0;
-    case IN_MOUSE_WHEEL: return (host->mouse_wheel & (1u<<b->value))!=0;
+    case IN_MOUSE_BUTTON: return (host->mouse_buttons & SDL_BUTTON_MASK(s->value))!=0;
+    case IN_MOUSE_WHEEL: return (host->mouse_wheel & (1u<<s->value))!=0;
     case IN_NONE: default: return 0;
     }
 }
+/* Evaluates one binding against the current host state (MIX-002/003/004): for a button-like
+ * binding, 1 if held, 0 otherwise -- a combo needs every source held. (Axis-like readings of a
+ * binding are binding_axis_value's job; `is_button_output` there tells which of the two the
+ * caller wants, see OUT-004/OUT-005.) */
+static int binding_held(const HostState *host, const InputBinding *b) {
+    for (uint8_t i=0;i<b->key_count;++i)
+        if (!source_active(host,&b->sources[i])) return 0;
+    return b->key_count>0;
+}
 /* Signed axis-unit contribution (-127..127) of one binding toward the stick it is bound to;
  * 0 for anything that is not an axis-like input. A plain key/button bound to a half-axis
- * output contributes a full deflection (KBD-006), matching the previous fixed-layout behavior. */
+ * output contributes a full deflection (KBD-006), matching the previous fixed-layout behavior.
+ * A combo contributes only as a whole (every source held); a lone physical axis keeps its
+ * value even below the button threshold, so analog pass-through
+ * (axis_left_x = axis_right_x) stays analog. */
 static int binding_axis_value(const HostState *host, const InputBinding *b, int half_sign) {
-    switch (b->kind) {
-    case IN_KEY: return (host->keys && host->keys[b->value]) ? 127*half_sign : 0;
-    case IN_CBUTTON: return (host->gamepad && SDL_GetGamepadButton(host->gamepad,(SDL_GamepadButton)b->value)) ? 127*half_sign : 0;
-    case IN_AXIS_HALF: {
-        if (!host->gamepad) return 0;
-        int16_t raw=SDL_GetGamepadAxis(host->gamepad,(SDL_GamepadAxis)b->value);
-        int v=raw>>8;
-        return b->half_sign>0 ? (v>0 ? v : 0) : (v<0 ? -v : 0);
+    if (b->key_count>1 && !binding_held(host,b)) return 0;
+    for (uint8_t i=0;i<b->key_count;++i) {
+        const InputSource *s=&b->sources[i];
+        switch (s->kind) {
+        case IN_KEY: case IN_CBUTTON: case IN_MOUSE_BUTTON: case IN_MOUSE_WHEEL:
+            return source_active(host,s) ? 127*half_sign : 0;
+        case IN_AXIS_HALF: {
+            if (!host->gamepad) return 0;
+            int v=SDL_GetGamepadAxis(host->gamepad,(SDL_GamepadAxis)s->value)>>8;
+            return s->half_sign>0 ? (v>0 ? v : 0) : (v<0 ? -v : 0);
+        }
+        case IN_AXIS: /* a full physical axis bound to another full axis output (axis_left_x=axis_right_x) */
+            return host->gamepad ? (SDL_GetGamepadAxis(host->gamepad,(SDL_GamepadAxis)s->value)>>8)*half_sign : 0;
+        default: break; /* IN_NONE */
+        }
     }
-    case IN_AXIS: /* a full physical axis bound to another full axis output (axis_left_x=axis_right_x) */
-        return host->gamepad ? (SDL_GetGamepadAxis(host->gamepad,(SDL_GamepadAxis)b->value)>>8) : 0;
-    case IN_MOUSE_BUTTON: return (host->mouse_buttons & SDL_BUTTON_MASK(b->value)) ? 127*half_sign : 0;
-    case IN_MOUSE_WHEEL: return (host->mouse_wheel & (1u<<b->value)) ? 127*half_sign : 0;
-    default: return 0; /* IN_NONE */
-    }
-}
-/* Sums every binding on `out` (MIX-003), clamped to -127..127. */
-static int axis_output_value(const HostState *host, const InputConfig *cfg, InputOutput out, int half_sign) {
-    long sum=0;
-    for (int i=0;i<cfg->table.binding_count[out];++i)
-        sum+=binding_axis_value(host,&cfg->table.bindings[out][i],half_sign);
-    return sum<-127 ? -127 : sum>127 ? 127 : (int)sum;
-}
-/* True if any binding on `out` is currently held (MIX-002: OR). */
-static int button_output_held(const HostState *host, const InputConfig *cfg, InputOutput out) {
-    for (int i=0;i<cfg->table.binding_count[out];++i)
-        if (binding_held(host,&cfg->table.bindings[out][i])) return 1;
     return 0;
+}
+/* shadPS4's binding pass (input_handler.cpp ProcessBinding): connections are evaluated
+ * longest-binding-first and every input a fired binding used is claimed for that sample, so a
+ * claimed input cannot satisfy another binding (shadPS4's pressed-keys flag). That is what
+ * gives a combo priority over the single-key actions sharing its inputs: with shift+M1 held,
+ * "r2 = lshift,leftbutton" fires while "r1 = leftbutton" and "leftjoystick_halfmode = lshift"
+ * stay off, instead of all three firing together. Bindings made only of physical axes
+ * (stick/trigger pass-throughs) take no part in the pass; they read their value directly, like
+ * shadPS4's analog path. */
+static uint8_t binding_fired[OUT_COUNT][INPUT_MAX_BINDINGS_PER_OUTPUT];
+
+static int source_is_axis(const InputSource *s) {
+    return s->kind==IN_AXIS || s->kind==IN_AXIS_HALF;
+}
+static int binding_is_axis_only(const InputBinding *b) {
+    for (uint8_t i=0;i<b->key_count;++i)
+        if (!source_is_axis(&b->sources[i])) return 0;
+    return 1;
+}
+static int source_claimed(const InputSource *claimed, int count, const InputSource *s) {
+    for (int i=0;i<count;++i)
+        if (claimed[i].kind==s->kind && claimed[i].value==s->value &&
+            (s->kind!=IN_AXIS_HALF || claimed[i].half_sign==s->half_sign)) return 1;
+    return 0;
+}
+static void evaluate_bindings(const HostState *host, const InputConfig *cfg) {
+    static InputSource claimed[3*OUT_COUNT*INPUT_MAX_BINDINGS_PER_OUTPUT]; /* one entry per source of every fired binding, at worst */
+    int claimed_count=0;
+    memset(binding_fired,0,sizeof(binding_fired));
+    for (int want=3;want>=1;--want) {
+        for (int out=0;out<OUT_COUNT;++out) {
+            for (int i=0;i<cfg->table.binding_count[out];++i) {
+                const InputBinding *b=&cfg->table.bindings[out][i];
+                if (b->key_count!=want || binding_is_axis_only(b)) continue;
+                int fire=1;
+                for (uint8_t k=0;k<b->key_count && fire;++k) {
+                    if (!source_active(host,&b->sources[k])) fire=0;
+                    else if (source_claimed(claimed,claimed_count,&b->sources[k])) fire=0;
+                }
+                if (!fire) continue;
+                for (uint8_t k=0;k<b->key_count;++k) claimed[claimed_count++]=b->sources[k];
+                binding_fired[out][i]=1;
+            }
+        }
+    }
+}
+/* True if `out` reads as pressed -- a fired binding, or an axis-only binding whose own
+ * threshold is met (those bypass the pass above). */
+static int output_button_held(const HostState *host, const InputConfig *cfg, InputOutput out) {
+    for (int i=0;i<cfg->table.binding_count[out];++i) {
+        const InputBinding *b=&cfg->table.bindings[out][i];
+        if (binding_fired[out][i]) return 1;
+        if (binding_is_axis_only(b) && binding_held(host,b)) return 1;
+    }
+    return 0;
+}
+/* Sums every fired binding on `out` (MIX-003), clamped to -127..127; axis-only bindings
+ * contribute directly (analog pass-through). */
+static int output_axis_value(const HostState *host, const InputConfig *cfg, InputOutput out, int half_sign) {
+    long sum=0;
+    for (int i=0;i<cfg->table.binding_count[out];++i) {
+        const InputBinding *b=&cfg->table.bindings[out][i];
+        if (!binding_fired[out][i] && !binding_is_axis_only(b)) continue;
+        sum+=binding_axis_value(host,b,half_sign);
+    }
+    return sum<-127 ? -127 : sum>127 ? 127 : (int)sum;
 }
 /* DZN-001: shadPS4's ApplyDeadzone, ported -- below inner: 0; inner..outer: linear ramp to 127;
  * above outer: 127. Applied to the magnitude, sign preserved. */
@@ -198,6 +263,38 @@ static int apply_deadzone(int value, int inner, int outer) {
     if (mag>=outer) return value<0 ? -127 : 127;
     long scaled=(127L*(mag-inner))/(outer-inner);
     return value<0 ? -(int)scaled : (int)scaled;
+}
+
+/* STK-001: shadlixps4's UpdateAxisSmoothing, ported: a stick driven by keys/buttons ramps
+ * linearly from where it was to its new target over 33 ms and snaps when within 8 units.
+ * shadPS4 advances this on a 16 ms timer for every binding-driven axis (GameController::Axis,
+ * smooth=true by default); here it advances once per sample, one game frame each.
+ *
+ * Without it a key press teleports the stick across in a single frame: releasing W as D goes
+ * down snaps the stick direction 90 degrees at once, which the game turns into a hard corner;
+ * with the ramp the value sweeps through the diagonal, so the character turns through it (the
+ * "draws a circle" feel of shadPS4's keyboard sticks).
+ *
+ * The mouse contribution is added after the ramp and stays instant, matching shadPS4's
+ * EmulateJoystick, whose axis writes pass smooth=false. */
+#define STICK_RAMP_US 33000
+typedef struct { int value, target, start; uint64_t start_us; } StickRamp;
+static StickRamp stick_ramp[4]; /* left x, left y, right x, right y; zero = centered */
+static int ramp_stick(StickRamp *r, int target, uint64_t now) {
+    if (target != r->target) {
+        r->target=target;
+        r->start=r->value;
+        r->start_us=now;
+    }
+    if (r->value != r->target) {
+        if (abs(r->target-r->value)<8 || now-r->start_us>=STICK_RAMP_US) {
+            r->value=r->target;
+        } else {
+            long t=(long)((now-r->start_us)*1000/STICK_RAMP_US);
+            r->value=r->start+(int)((long)(r->target-r->start)*t/1000);
+        }
+    }
+    return r->value;
 }
 
 /* MOU-009: converts raw mouse motion straight into shadPS4's linear response (magnitude*speed +
@@ -343,6 +440,7 @@ static void sample_host(PadData *d) {
     BbMouseInput mouse; bbgpu_mouse_take(&mouse); /* MOU-008: drains dx/dy; buttons/wheel persist */
     HostState host={SDL_WasInit(SDL_INIT_VIDEO) ? SDL_GetKeyboardState(NULL) : NULL, g,
         mouse.captured ? mouse.buttons : 0, mouse.captured ? mouse.wheel : 0};
+    evaluate_bindings(&host,cfg); /* one priority/claim pass per sample; output_* read it */
 
     /* MIX-001/002: keyboard, controller (and, from T5, mouse) are read together, buttons ORed.
      * OUT_L2/OUT_R2 are skipped here (button_bit returns 0 for them anyway) and handled below,
@@ -353,33 +451,41 @@ static void sample_host(PadData *d) {
     };
     for (size_t i=0;i<sizeof(plain_buttons)/sizeof(*plain_buttons);++i) {
         InputOutput out=plain_buttons[i];
-        if (button_output_held(&host,cfg,out)) d->buttons|=button_bit(out);
+        if (output_button_held(&host,cfg,out)) d->buttons|=button_bit(out);
     }
-    /* OUT-003/OUT-004: l2/r2 carry both a button bit and an analog value. A gatilho físico
-     * passes its own reading; a plain button/key bound to l2/r2 snaps the analog to 255,
-     * matching the pre-existing keyboard behavior (KBD-006). */
+    /* OUT-003/OUT-004: l2/r2 carry both a button bit and an analog value; the contributions ADD
+     * UP, like shadPS4's new_param accumulator -- an idle physical trigger bound to the same
+     * output must never erase a keyboard/mouse press (with both "r2 = lshift,leftbutton" and
+     * the controller's "r2 = r2" in the file, the combo holds R2 at 255 while the stick at rest
+     * adds 0). A lone IN_AXIS source passes the physical reading through; a fired binding (or an
+     * axis-only one whose threshold is met) adds a full press. */
+    int32_t l2_value=0, r2_value=0;
     for (int i=0;i<cfg->table.binding_count[OUT_L2];++i) {
         const InputBinding *b=&cfg->table.bindings[OUT_L2][i];
-        if (b->kind==IN_AXIS) { if (host.gamepad) d->l2=trigger(SDL_GetGamepadAxis(host.gamepad,(SDL_GamepadAxis)b->value)); }
-        else if (binding_held(&host,b)) d->l2=255;
+        if (b->key_count==1 && b->sources[0].kind==IN_AXIS) {
+            if (host.gamepad) l2_value+=trigger(SDL_GetGamepadAxis(host.gamepad,(SDL_GamepadAxis)b->sources[0].value));
+        } else if (binding_fired[OUT_L2][i] || (binding_is_axis_only(b) && binding_held(&host,b))) l2_value+=255;
     }
     for (int i=0;i<cfg->table.binding_count[OUT_R2];++i) {
         const InputBinding *b=&cfg->table.bindings[OUT_R2][i];
-        if (b->kind==IN_AXIS) { if (host.gamepad) d->r2=trigger(SDL_GetGamepadAxis(host.gamepad,(SDL_GamepadAxis)b->value)); }
-        else if (binding_held(&host,b)) d->r2=255;
+        if (b->key_count==1 && b->sources[0].kind==IN_AXIS) {
+            if (host.gamepad) r2_value+=trigger(SDL_GetGamepadAxis(host.gamepad,(SDL_GamepadAxis)b->sources[0].value));
+        } else if (binding_fired[OUT_R2][i] || (binding_is_axis_only(b) && binding_held(&host,b))) r2_value+=255;
     }
+    d->l2=l2_value>255 ? 255 : (uint8_t)l2_value;
+    d->r2=r2_value>255 ? 255 : (uint8_t)r2_value;
     if (d->l2>INPUT_TRIGGER_BUTTON_THRESHOLD) d->buttons|=BTN_L2;
     if (d->r2>INPUT_TRIGGER_BUTTON_THRESHOLD) d->buttons|=BTN_R2;
 
     /* MIX-003/HLF-001/DZN-001: sticks, summed across sources, then deadzone, then halfmode. */
-    int lx=axis_output_value(&host,cfg,OUT_AXIS_LEFT_X_MINUS,-1)+axis_output_value(&host,cfg,OUT_AXIS_LEFT_X_PLUS,1)
-          +axis_output_value(&host,cfg,OUT_AXIS_LEFT_X,1);
-    int ly=axis_output_value(&host,cfg,OUT_AXIS_LEFT_Y_MINUS,-1)+axis_output_value(&host,cfg,OUT_AXIS_LEFT_Y_PLUS,1)
-          +axis_output_value(&host,cfg,OUT_AXIS_LEFT_Y,1);
-    int rx=axis_output_value(&host,cfg,OUT_AXIS_RIGHT_X_MINUS,-1)+axis_output_value(&host,cfg,OUT_AXIS_RIGHT_X_PLUS,1)
-          +axis_output_value(&host,cfg,OUT_AXIS_RIGHT_X,1);
-    int ry=axis_output_value(&host,cfg,OUT_AXIS_RIGHT_Y_MINUS,-1)+axis_output_value(&host,cfg,OUT_AXIS_RIGHT_Y_PLUS,1)
-          +axis_output_value(&host,cfg,OUT_AXIS_RIGHT_Y,1);
+    int lx=output_axis_value(&host,cfg,OUT_AXIS_LEFT_X_MINUS,-1)+output_axis_value(&host,cfg,OUT_AXIS_LEFT_X_PLUS,1)
+          +output_axis_value(&host,cfg,OUT_AXIS_LEFT_X,1);
+    int ly=output_axis_value(&host,cfg,OUT_AXIS_LEFT_Y_MINUS,-1)+output_axis_value(&host,cfg,OUT_AXIS_LEFT_Y_PLUS,1)
+          +output_axis_value(&host,cfg,OUT_AXIS_LEFT_Y,1);
+    int rx=output_axis_value(&host,cfg,OUT_AXIS_RIGHT_X_MINUS,-1)+output_axis_value(&host,cfg,OUT_AXIS_RIGHT_X_PLUS,1)
+          +output_axis_value(&host,cfg,OUT_AXIS_RIGHT_X,1);
+    int ry=output_axis_value(&host,cfg,OUT_AXIS_RIGHT_Y_MINUS,-1)+output_axis_value(&host,cfg,OUT_AXIS_RIGHT_Y_PLUS,1)
+          +output_axis_value(&host,cfg,OUT_AXIS_RIGHT_Y,1);
     lx=lx<-127?-127:lx>127?127:lx; ly=ly<-127?-127:ly>127?127:ly;
     rx=rx<-127?-127:rx>127?127:rx; ry=ry<-127?-127:ry>127?127:ry;
     lx=apply_deadzone(lx,cfg->deadzone[DEADZONE_LEFT_STICK].inner,cfg->deadzone[DEADZONE_LEFT_STICK].outer);
@@ -387,12 +493,25 @@ static void sample_host(PadData *d) {
     rx=apply_deadzone(rx,cfg->deadzone[DEADZONE_RIGHT_STICK].inner,cfg->deadzone[DEADZONE_RIGHT_STICK].outer);
     ry=apply_deadzone(ry,cfg->deadzone[DEADZONE_RIGHT_STICK].inner,cfg->deadzone[DEADZONE_RIGHT_STICK].outer);
 
-    /* CNV-001/MOU-009: the mouse contribution is added after the stick's own deadzone, not
-     * before it -- mouse_to_axis's own output-value lerp already keeps small/slow motion from
-     * producing a jumpy or oversized contribution (see its doc comment), so running the result
-     * through apply_deadzone too would just chop off the small end of an already-smooth curve. */
+    /* HLF-001: half-speed (walk) halves the stick before the ramp, like shadPS4's multiplier
+     * at the mapping step. The mouse below is outside the bindings pipeline and is not halved
+     * (shadPS4's mouse writes bypass the multiplier the same way). */
+    if (output_button_held(&host,cfg,OUT_LEFTJOYSTICK_HALFMODE)) { lx/=2; ly/=2; }
+    if (output_button_held(&host,cfg,OUT_RIGHTJOYSTICK_HALFMODE)) { rx/=2; ry/=2; }
+
+    uint64_t stick_now=now_us();
+    lx=ramp_stick(&stick_ramp[0],lx,stick_now);
+    ly=ramp_stick(&stick_ramp[1],ly,stick_now);
+    rx=ramp_stick(&stick_ramp[2],rx,stick_now);
+    ry=ramp_stick(&stick_ramp[3],ry,stick_now);
+
+    /* CNV-001/MOU-009: the mouse contribution is added after the stick's own deadzone and ramp,
+     * not before them -- mouse_to_axis's own output-value lerp already keeps small/slow motion
+     * from producing a jumpy or oversized contribution (see its doc comment), so running the
+     * result through apply_deadzone too would just chop off the small end of an already-smooth
+     * curve, and adding it before the ramp would make it glide into the keyboard's target. */
     if (mouse.captured && cfg->mouse.stick) {
-        uint64_t now=now_us();
+        uint64_t now=stick_now;
         double dt_ms=last_mouse_sample_us ? (double)(now-last_mouse_sample_us)/1000.0 : 33.0;
         if (dt_ms<1.0) dt_ms=1.0;
         if (dt_ms>100.0) dt_ms=100.0;
@@ -409,8 +528,6 @@ static void sample_host(PadData *d) {
         smoothed_mouse_stick_x=smoothed_mouse_stick_y=0.0;
     }
 
-    if (button_output_held(&host,cfg,OUT_LEFTJOYSTICK_HALFMODE)) { lx/=2; ly/=2; }
-    if (button_output_held(&host,cfg,OUT_RIGHTJOYSTICK_HALFMODE)) { rx/=2; ry/=2; }
     d->left_x=(uint8_t)(128+lx); d->left_y=(uint8_t)(128+ly);
     d->right_x=(uint8_t)(128+rx); d->right_y=(uint8_t)(128+ry);
 
@@ -433,9 +550,9 @@ static void sample_host(PadData *d) {
         if ((d->buttons & BTN_TOUCHPAD) && !d->touch_count) touch_click(d,0);
     }
     /* OUT-001: touchpad_left/center/right outputs, remappable, independent of the physical pad. */
-    if (button_output_held(&host,cfg,OUT_TOUCHPAD_LEFT)) touch_click(d,0);
-    if (button_output_held(&host,cfg,OUT_TOUCHPAD_RIGHT)) touch_click(d,1);
-    if (button_output_held(&host,cfg,OUT_TOUCHPAD_CENTER)) { d->buttons|=BTN_TOUCHPAD; d->touch_count=1; d->touches[0]=(PadTouch){.x=960,.y=471,.id=0}; }
+    if (output_button_held(&host,cfg,OUT_TOUCHPAD_LEFT)) touch_click(d,0);
+    if (output_button_held(&host,cfg,OUT_TOUCHPAD_RIGHT)) touch_click(d,1);
+    if (output_button_held(&host,cfg,OUT_TOUCHPAD_CENTER)) { d->buttons|=BTN_TOUCHPAD; d->touch_count=1; d->touches[0]=(PadTouch){.x=960,.y=471,.id=0}; }
 }
 
 /* BB_PAD_FILE=<file>: scripted input for automated runs. The file holds whitespace-separated

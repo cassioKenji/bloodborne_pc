@@ -15,17 +15,22 @@
 static int BindingCountFor(const InputConfig *cfg, InputOutput out) {
     return cfg->table.binding_count[out];
 }
+static int HasSource(const InputBinding *b, InputKind kind, int32_t value) {
+    for (uint8_t i = 0; i < b->key_count; ++i)
+        if (b->sources[i].kind == kind && b->sources[i].value == value) return 1;
+    return 0;
+}
 static int HasKeyBinding(const InputConfig *cfg, InputOutput out, SDL_Scancode sc) {
     for (int i = 0; i < cfg->table.binding_count[out]; ++i) {
         const InputBinding *b = &cfg->table.bindings[out][i];
-        if (b->kind == IN_KEY && b->value == (int32_t)sc) return 1;
+        if (HasSource(b, IN_KEY, (int32_t)sc)) return 1;
     }
     return 0;
 }
 static int HasCButtonBinding(const InputConfig *cfg, InputOutput out, int button) {
     for (int i = 0; i < cfg->table.binding_count[out]; ++i) {
         const InputBinding *b = &cfg->table.bindings[out][i];
-        if (b->kind == IN_CBUTTON && b->value == button) return 1;
+        if (HasSource(b, IN_CBUTTON, button)) return 1;
     }
     return 0;
 }
@@ -97,13 +102,48 @@ static void TestColonSuffixDiscarded(void) {
     assert(HasCButtonBinding(&cfg, OUT_R1, SDL_GAMEPAD_BUTTON_RIGHT_SHOULDER));
 }
 
-/* CFG-005: a comma in the input (a combo) is out of scope and warned, not silently accepted
- * as a single bad token. */
-static void TestComboInputWarns(void) {
+/* A comma-separated input is a combo: one binding holding all its sources, in any order, and
+ * only fireable when every one of them is held (shadPS4's InputBinding). This is what makes a
+ * shadPS4 config with "r2 = lshift,leftbutton" (dodge on Shift+Right Click) import intact. */
+static void TestComboBinding(void) {
     InputConfig cfg;
-    input_config_parse(&cfg, "l2 = lshift,mousewheelup\n");
+    input_config_parse(&cfg, "l2 = lshift,mousewheelup\nr2 = lshift,leftbutton\n");
+    assert(cfg.warnings == 0);
+    assert(BindingCountFor(&cfg, OUT_L2) == 1);
+    const InputBinding *combo = &cfg.table.bindings[OUT_L2][0];
+    assert(combo->key_count == 2);
+    assert(HasSource(combo, IN_KEY, SDL_SCANCODE_LSHIFT));
+    assert(HasSource(combo, IN_MOUSE_WHEEL, 0 /* WHEEL_UP */));
+    assert(BindingCountFor(&cfg, OUT_R2) == 1);
+    assert(cfg.table.bindings[OUT_R2][0].key_count == 2);
+    assert(HasSource(&cfg.table.bindings[OUT_R2][0], IN_MOUSE_BUTTON, SDL_BUTTON_LEFT));
+}
+
+/* A repeated token in a combo is collapsed (ANDing a key with itself is a no-op), like shadPS4. */
+static void TestComboDuplicateCollapsed(void) {
+    InputConfig cfg;
+    input_config_parse(&cfg, "cross = space,space\n");
+    assert(cfg.warnings == 0);
+    assert(BindingCountFor(&cfg, OUT_CROSS) == 1);
+    assert(cfg.table.bindings[OUT_CROSS][0].key_count == 1);
+}
+
+/* A malformed token or a 4th key rejects the whole combo, not just the bad token: a typo in
+ * "lshift,lefbutton" must not silently leave a binding that fires on Shift alone. */
+static void TestComboInvalidTokenRejected(void) {
+    InputConfig cfg;
+    input_config_parse(&cfg, "r2 = lshift,banana\ncross = space,enter,lshift,r\n");
+    assert(cfg.warnings == 2);
+    assert(BindingCountFor(&cfg, OUT_R2) == 0);
+    assert(BindingCountFor(&cfg, OUT_CROSS) == 0);
+}
+
+/* A reserved key inside a combo rejects the whole line (HOT-001), same as a single input. */
+static void TestComboReservedKeyRejected(void) {
+    InputConfig cfg;
+    input_config_parse(&cfg, "cross = lshift,insert\n");
     assert(cfg.warnings == 1);
-    assert(BindingCountFor(&cfg, OUT_L2) == 0);
+    assert(BindingCountFor(&cfg, OUT_CROSS) == 0);
 }
 
 /* CFG-006: an output this port does not support (key_toggle) is skipped with one warning, and
@@ -202,9 +242,9 @@ static void TestHalfAxisNames(void) {
     input_config_parse(&cfg, "axis_left_x_minus = axis_left_x_minus\naxis_left_x_plus = axis_left_x_plus\n");
     assert(cfg.warnings == 0);
     assert(cfg.table.binding_count[OUT_AXIS_LEFT_X_MINUS] == 1);
-    assert(cfg.table.bindings[OUT_AXIS_LEFT_X_MINUS][0].kind == IN_AXIS_HALF);
-    assert(cfg.table.bindings[OUT_AXIS_LEFT_X_MINUS][0].half_sign == -1);
-    assert(cfg.table.bindings[OUT_AXIS_LEFT_X_PLUS][0].half_sign == 1);
+    assert(cfg.table.bindings[OUT_AXIS_LEFT_X_MINUS][0].sources[0].kind == IN_AXIS_HALF);
+    assert(cfg.table.bindings[OUT_AXIS_LEFT_X_MINUS][0].sources[0].half_sign == -1);
+    assert(cfg.table.bindings[OUT_AXIS_LEFT_X_PLUS][0].sources[0].half_sign == 1);
 }
 
 /* The compiled-in default file must itself parse with only the one documented warning
@@ -280,7 +320,10 @@ int main(void) {
     TestDefaultHotkeyKeyReserved();
     TestWhitespaceCommentsAndCase();
     TestColonSuffixDiscarded();
-    TestComboInputWarns();
+    TestComboBinding();
+    TestComboDuplicateCollapsed();
+    TestComboInvalidTokenRejected();
+    TestComboReservedKeyRejected();
     TestUnsupportedOutputWarnsAndContinues();
     TestUnmappedIsNotAWarning();
     TestDuplicateLineHarmless();
