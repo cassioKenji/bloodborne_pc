@@ -13,7 +13,11 @@ mouse-as-touchpad) are skipped with one log warning per line; the rest of the fi
 Keyboard and controller bindings are always combined, not a fallback: the keyboard works
 whether or not a controller is connected. When more than one source is bound to the same
 output, buttons need only one source held; stick axes add their contributions together (and
-are then clamped and passed through the deadzone), matching shadPS4.
+are then clamped and passed through the deadzone), matching shadPS4. A stick value built from
+keys and buttons is then ramped to its target over 33 ms, shadPS4's axis smoothing
+(`UpdateAxisSmoothing`): a change sweeps the stick through the intermediate directions
+(pressing D while releasing W turns through the diagonal) instead of teleporting in one frame;
+the mouse-look contribution is exempt and applies instantly, like shadPS4's mouse writes.
 
 ## Outputs
 
@@ -68,9 +72,19 @@ so the result does not depend on the game's frame rate. `speed` scales sensitivi
 adds a constant on top of it, raising the response for slow movements without affecting fast ones
 much. `deadzone_offset` is parsed for compatibility with existing files but no longer affects the
 camera (an earlier version of this formula used it as a startup floor; the launcher's
-"Smoothness" slider was removed along with that). Mouse buttons and the wheel only act while the
-mouse is actually captured (window focused, settings menu and text entry closed, and look turned
-on) — clicking the window to give it focus never fires an attack.
+"Smoothness" slider was removed along with that).
+
+**F7 toggles only this camera mapping** (F8 reloads the file), and it starts off: a
+`mouse_to_joystick` line only makes the feature available, exactly like shadPS4, whose mouse
+mode is off until F7. Mouse buttons and the wheel are independent of the toggle: they act
+whenever the game owns the mouse (window focused, settings menu and text entry closed). With
+look off, mouse motion is simply dropped, not banked — turning look back on never snaps the
+camera with motion from while it was off. Clicking the window to give it focus never fires an
+attack.
+
+The F4 mousecam (the direct camera write) and this mouse-to-stick look both steer the camera
+from the same mouse, so they are mutually exclusive: turning on one turns the other off. Use
+whichever fits — F4 for the 1:1 direct-write camera, F7 for the shadPS4-style stick.
 
 **Known limitation:** the stick is still a stick. Camera rotation saturates at the game's own
 maximum turn speed and inherits its acceleration curve; this is not 1:1 mouse aim, by design —
@@ -98,7 +112,7 @@ mouse look or reloads the file (`f7`/`f8` by default, or whatever `hotkey_toggle
 ```ini
 # bbport input (shadPS4 syntax: output = input, one input per line).
 # A shadPS4 input config (user/input_config/CUSA03173.ini) can be copied over this file.
-# F7 toggles the mouse, F8 reloads this file.
+# F7 toggles mouse look, F8 reloads this file.
 
 # Keyboard
 cross = space
@@ -132,7 +146,7 @@ axis_right_y_plus = down
 # Hold to halve the left stick (walk): uncomment and pick a key
 # leftjoystick_halfmode = lalt
 
-# Mouse (uncomment mouse_to_joystick to turn it on; buttons work only while captured)
+# Mouse (uncomment mouse_to_joystick for mouse look; buttons work while focused)
 # mouse_to_joystick = right
 mouse_movement_params = 0.5, 1, 0.125
 r1 = leftbutton

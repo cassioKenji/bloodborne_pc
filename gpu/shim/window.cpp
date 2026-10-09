@@ -125,19 +125,25 @@ bool WindowSDL::PollEvents() {
         } else if (event.type == SDL_EVENT_WINDOW_FOCUS_LOST) {
             window_focused = false;
         }
-        // Mouse motion/buttons/wheel feed the pad only while captured (MOU-002..006); the
-        // overlay (menu) gets its own mouse handling below via BbOverlay::HandleEvent and is
-        // mutually exclusive with capture (WantsMouseCapture() is false whenever the menu is
-        // open), so there is no double consumption of the same event by both paths. Note:
-        // mouse_captured_last only updates once per PollEvents call (below the event loop), so
-        // a menu-opening event (L3+R3, Insert) followed within the same batch by a mouse event
-        // can still see the old captured state for one iteration; accepted as a one-frame
-        // edge case rather than re-evaluating capture per event for a cosmetic gain.
+        // Mouse motion/buttons/wheel feed the pad while captured (MOU-002..006; capture is
+        // "focused and no menu or text entry", MOU-003); the overlay (menu) gets its own mouse
+        // handling below via BbOverlay::HandleEvent and is mutually exclusive with capture
+        // (WantsMouseCapture() is false whenever the menu is open), so there is no double
+        // consumption of the same event by both paths. Note: mouse_captured_last only updates
+        // once per PollEvents call (below the event loop), so a menu-opening event (L3+R3,
+        // Insert) followed within the same batch by a mouse event can still see the old
+        // captured state for one iteration; accepted as a one-frame edge case rather than
+        // re-evaluating capture per event for a cosmetic gain.
         if (mouse_captured_last) {
             if (event.type == SDL_EVENT_MOUSE_MOTION) {
-                std::scoped_lock lock{mouse_mutex};
-                mouse.dx += event.motion.xrel;
-                mouse.dy += event.motion.yrel;
+                // MOU-002: the hotkey gates only the camera mapping. With look off the motion
+                // is dropped (not banked for a later re-enable); buttons and the wheel below
+                // stay live, so F7 never costs the player their attack/aim bindings.
+                if (mouse_mode_on.load(std::memory_order_relaxed)) {
+                    std::scoped_lock lock{mouse_mutex};
+                    mouse.dx += event.motion.xrel;
+                    mouse.dy += event.motion.yrel;
+                }
             } else if (event.type == SDL_EVENT_MOUSE_BUTTON_DOWN || event.type == SDL_EVENT_MOUSE_BUTTON_UP) {
                 std::scoped_lock lock{mouse_mutex};
                 const uint32_t mask = SDL_BUTTON_MASK(event.button.button);
@@ -206,9 +212,11 @@ bool WindowSDL::PollEvents() {
 }
 
 bool WindowSDL::WantsMouseCapture() const {
-    // MOU-003: all of mouse mode on, window focused, menu closed, text dialog inactive.
-    // BbOverlay::CapturesInput() already covers both the menu and the text entry box.
-    return mouse_mode_on.load(std::memory_order_relaxed) && window_focused && !BbOverlay::CapturesInput();
+    // MOU-003: window focused, menu closed, text dialog inactive. The mouse-look toggle is
+    // deliberately not part of this (MOU-002): with look off, only the camera mapping stops
+    // (gated at motion accumulation in PollEvents); buttons and the wheel stay live whenever
+    // the game owns the mouse. BbOverlay::CapturesInput() covers the menu and the text entry box.
+    return window_focused && !BbOverlay::CapturesInput();
 }
 
 void WindowSDL::UpdateMouseCapture() {
@@ -260,12 +268,10 @@ void WindowSDL::ConfigureInput(bool mouse_mode_available_, int32_t toggle_scanco
         // MOU-001: without mouse_to_joystick in input.ini, the mode does not exist; turning it
         // off here also covers an F8 reload that removed the line while it was on.
         mouse_mode_on.store(false, std::memory_order_relaxed);
-    } else if (!input_configured_once.exchange(true, std::memory_order_relaxed)) {
-        // MOU-002: "mode starts on" applies only to the very first load (game startup). A
-        // later F8 reload that keeps mouse_to_joystick present must not re-enable a mode the
-        // player turned off with the hotkey in between.
-        mouse_mode_on.store(true, std::memory_order_relaxed);
     }
+    // The mode starts off, matching shadPS4 (MouseMode::Off until the hotkey turns it on):
+    // a config with mouse_to_joystick only makes the feature available, it must not start
+    // steering the camera by itself.
 }
 
 int WindowSDL::TakeInputReloadRequested() {

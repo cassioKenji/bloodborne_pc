@@ -161,9 +161,10 @@ const char *input_output_name(InputOutput out) {
     return "?";
 }
 
-/* ---- Binding resolution for one input token ------------------------------------------ */
+/* ---- Binding resolution for one input line ------------------------------------------- */
 
-static int ResolveInput(const char *token, InputBinding *out) {
+/* Resolves one input token. "unmapped" yields IN_NONE ("never fires"), but is a valid token. */
+static int ResolveInput(const char *token, InputSource *out) {
     int32_t v;
     if (EqualsCaseInsensitive(token, "unmapped")) { out->kind = IN_NONE; return 1; }
     if (LOOKUP(kKeyNames, token, &v)) {
@@ -183,6 +184,44 @@ static int ResolveInput(const char *token, InputBinding *out) {
         }
     }
     return 0;
+}
+
+/* An input line, comma-separated: one token is a plain binding, several are a combo that only
+ * fires while all of them are held ("lshift,leftbutton" -> R2; shadPS4's InputBinding up to 3
+ * keys). A repeated token is collapsed, as in shadPS4 (ANDing a key with itself is a no-op).
+ * Any invalid token, an empty token or a 4th key rejects the whole line with one warning --
+ * simpler than shadPS4's "keep the valid prefix", and it cannot turn a typo into a binding
+ * that fires on fewer keys than the file asked for. */
+static int ResolveBinding(const char *text, InputBinding *out) {
+    out->key_count = 0;
+    const char *p = text;
+    for (;;) {
+        const char *comma = strchr(p, ',');
+        size_t n = comma ? (size_t)(comma - p) : strlen(p);
+        if (n == 0) return 0;
+        char token[NAME_MAX + 1];
+        if (n > NAME_MAX) return 0;
+        memcpy(token, p, n);
+        token[n] = '\0';
+        InputSource source = { IN_NONE, 0, 0 };
+        if (!ResolveInput(token, &source)) return 0;
+        if (source.kind != IN_NONE) {
+            int dup = 0;
+            for (uint8_t i = 0; i < out->key_count; ++i) {
+                if (out->sources[i].kind == source.kind && out->sources[i].value == source.value &&
+                    (source.kind != IN_AXIS_HALF || out->sources[i].half_sign == source.half_sign))
+                    dup = 1;
+            }
+            if (!dup) {
+                if (out->key_count >= 3) return 0;
+                out->sources[out->key_count++] = source;
+            }
+        }
+        if (!comma) break;
+        p = comma + 1;
+    }
+    if (out->key_count == 0) { out->sources[0].kind = IN_NONE; return 1; } /* "unmapped" alone */
+    return 1;
 }
 
 /* ---- Hotkey reservation (HOT-001, HOT-002) -------------------------------------------- */
@@ -212,12 +251,22 @@ typedef struct {
     int hotkeys_pass; /* 1: only hotkey_, mouse_ and analog_deadzone lines; 0: everything else */
 } ParseState;
 
-/* A duplicate line (same output, same input) has no extra effect and is not a warning
+/* A duplicate line (same output, same inputs) has no extra effect and is not a warning
  * (spec section 9): "cross = space" twice must leave exactly one binding, not two identical
  * ones that would otherwise just double-count toward INPUT_MAX_BINDINGS_PER_OUTPUT. */
-static int SameBinding(const InputBinding *a, const InputBinding *b) {
+static int SameSource(const InputSource *a, const InputSource *b) {
     return a->kind == b->kind && a->value == b->value &&
            (a->kind != IN_AXIS_HALF || a->half_sign == b->half_sign);
+}
+static int SameBinding(const InputBinding *a, const InputBinding *b) {
+    if (a->key_count != b->key_count) return 0;
+    for (uint8_t i = 0; i < a->key_count; ++i) {
+        int found = 0;
+        for (uint8_t j = 0; j < b->key_count && !found; ++j)
+            if (SameSource(&a->sources[i], &b->sources[j])) found = 1;
+        if (!found) return 0;
+    }
+    return 1;
 }
 static void AddBinding(InputConfig *cfg, InputOutput out, InputBinding binding) {
     uint8_t *count = &cfg->table.binding_count[out];
@@ -343,10 +392,6 @@ static void ParseLine(ParseState *state, char *line) {
     }
     if (state->hotkeys_pass) return; /* everything else is handled only in the main pass */
 
-    /* CFG-005: one input per line; a comma here means a combo, which is out of scope. Checked
-     * only in the main pass (reached once per line, unlike the hotkey branch above). */
-    if (strchr(input_raw, ',')) { ++cfg->warnings; return; }
-
     InputOutput out;
     if (!input_output_from_name(output_raw, &out)) {
         /* CFG-006: either an output this port never supports (key_toggle, the shadPS4 hotkeys
@@ -356,11 +401,17 @@ static void ParseLine(ParseState *state, char *line) {
         return;
     }
     InputBinding binding;
-    if (!ResolveInput(input_raw, &binding)) { ++cfg->warnings; return; }
-    if (binding.kind == IN_NONE) return; /* "unmapped": explicitly no binding, not a warning */
+    if (!ResolveBinding(input_raw, &binding)) { ++cfg->warnings; return; }
+    if (binding.key_count == 0) return; /* "unmapped": explicitly no binding, not a warning */
 
-    /* HOT-001: a game-output binding cannot use a reserved key. */
-    if (binding.kind == IN_KEY && IsReservedScancode(binding.value, cfg)) { ++cfg->warnings; return; }
+    /* HOT-001: a game-output binding cannot use a reserved key; one reserved key in a combo
+     * rejects the whole line. */
+    for (uint8_t i = 0; i < binding.key_count; ++i) {
+        if (binding.sources[i].kind == IN_KEY && IsReservedScancode(binding.sources[i].value, cfg)) {
+            ++cfg->warnings;
+            return;
+        }
+    }
 
     AddBinding(cfg, out, binding);
 }
@@ -476,7 +527,7 @@ const char *input_config_default_text(void) {
     return
 "# bbport input (shadPS4 syntax: output = input, one input per line).\n"
 "# A shadPS4 input config (user/input_config/CUSA03173.ini) can be copied over this file.\n"
-"# F7 toggles the mouse, F8 reloads this file.\n"
+"# F7 toggles mouse look, F8 reloads this file.\n"
 "\n"
 "# Keyboard\n"
 "cross = space\n"
@@ -510,7 +561,7 @@ const char *input_config_default_text(void) {
 "# Hold to halve the left stick (walk): uncomment and pick a key\n"
 "# leftjoystick_halfmode = lalt\n"
 "\n"
-"# Mouse (uncomment mouse_to_joystick to turn it on; buttons work only while captured)\n"
+"# Mouse (uncomment mouse_to_joystick for mouse look; buttons work while focused)\n"
 "# mouse_to_joystick = right\n"
 "mouse_movement_params = 0.5, 1, 0.125\n"
 "r1 = leftbutton\n"

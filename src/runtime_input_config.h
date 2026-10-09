@@ -32,13 +32,20 @@ typedef enum {
     IN_MOUSE_WHEEL,   /* value is 0=up,1=down,2=left,3=right */
     IN_CBUTTON,       /* value is an SDL_GAMEPAD_BUTTON_* */
     IN_AXIS,          /* value is an SDL_GAMEPAD_AXIS_*, full range (l2/r2/axis_*) */
-    IN_AXIS_HALF,     /* value is an SDL_GAMEPAD_AXIS_*; sign carried in InputBinding.half_sign */
+    IN_AXIS_HALF,     /* value is an SDL_GAMEPAD_AXIS_*; sign carried in InputSource.half_sign */
 } InputKind;
 
 typedef struct {
     InputKind kind;
     int32_t value;
     int8_t half_sign; /* +1/-1 for IN_AXIS_HALF; unused otherwise */
+} InputSource;
+
+/* One input line. A combo ("lshift,leftbutton") fires only while every source is held, like N
+ * sources ANDed together; a single-source line (the common case) has key_count == 1. */
+typedef struct {
+    InputSource sources[3]; /* shadPS4 InputBinding::keys[3]; unused slots are IN_NONE */
+    uint8_t key_count;
 } InputBinding;
 
 /* OUT-004/OUT-005: thresholds used by runtime_pad.c (T2) to turn an analog input bound to a

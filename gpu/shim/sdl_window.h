@@ -78,19 +78,17 @@ private:
     std::mutex mouse_mutex;
     MouseInput mouse;
     std::atomic<bool> mouse_mode_available{false};  // MOU-001: mouse_to_joystick present in input.ini
-    std::atomic<bool> mouse_mode_on{false};         // toggled by the hotkey (MOU-002); not saved
-    std::atomic<bool> input_configured_once{false}; // MOU-002: turn mouse_mode_on on only on the
-                                                      // very first ConfigureInput (startup), never
-                                                      // again on an F8 reload (which must not
-                                                      // override a mode the player toggled with F7)
+    std::atomic<bool> mouse_mode_on{false};         // toggled by the hotkey (MOU-002); starts off
+                                                      // (like shadPS4); not saved
     // HOT-002: 0 (SDL_SCANCODE_UNKNOWN) until ConfigureInput runs once; no event ever carries
     // that scancode, so 0 doubles safely as "no key bound" without a separate sentinel.
     std::atomic<int32_t> toggle_scancode{0};
     std::atomic<int32_t> reload_scancode{0};
     std::atomic<bool> reload_requested{false};      // HOT-003, drained by TakeInputReloadRequested
     bool window_focused{true};
-    /// Window thread, every PollEvents: MOU-003. True iff mouse mode is on, the window has
-    /// focus, and neither the menu nor the text dialog is capturing input.
+    /// Window thread, every PollEvents: MOU-003. True iff the window has focus and neither the
+    /// menu nor the text dialog is capturing input. Mouse look is not part of this (MOU-002):
+    /// F7 only gates the camera mapping, buttons/wheel stay live either way.
     bool WantsMouseCapture() const;
     /// Window thread: applies SDL_SetWindowRelativeMouseMode only when WantsMouseCapture()'s
     /// result changed since the last call, and resets the accumulator when capture ends

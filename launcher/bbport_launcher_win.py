@@ -858,11 +858,11 @@ class Launcher:
     def build_controls(self):
         ttk, tk = self.ttk, self.tk
         f = self.scrolled_page('controls', _('Controls', 'Управление'),
-                               _('Keyboard and mouse-button bindings. The controller keeps '
-                                 'working side by side; edit its lines in input.ini directly — '
+                               _('Keyboard and mouse bindings. The controller keeps working '
+                                 'side by side; edit its bindings in input.ini directly — '
                                  'see docs/INPUT.md.',
-                                 'Раскладка клавиатуры и кнопок мыши. Геймпад продолжает '
-                                 'работать одновременно; его строки можно настроить только в '
+                                 'Раскладка клавиатуры и мыши. Геймпад продолжает работать '
+                                 'одновременно; его привязки пока можно настроить только в '
                                  'input.ini — см. docs/INPUT.md.'))
         self.remap_rows = {}
 
@@ -870,7 +870,7 @@ class Launcher:
             r = self.next_row(parent)
             label, _ru = OUTPUT_LABELS[output]
             ttk.Label(parent, text=_(label, _ru)).grid(row=r, column=0, sticky='w', padx=(0, 18), pady=4)
-            key_label = ttk.Label(parent, width=14, style='Muted.TLabel')
+            key_label = ttk.Label(parent, width=22, style='Muted.TLabel')
             key_label.grid(row=r, column=1, sticky='w', pady=4)
             set_btn = ttk.Button(parent, text=_('Set…', 'Назначить…'),
                                  command=lambda o=output: self.start_remap_capture(o, key_label, set_btn))
@@ -887,21 +887,24 @@ class Launcher:
         self.section(f, _('Sticks', 'Стики'))
         for output in STICK_OUTPUTS:
             add_row(f, output)
-        self.note(f, _('Click "Set…" on a button row to bind a mouse button instead of a key — '
-                       'left, middle, right, or the side buttons (back/forward), if the mouse '
-                       'has them. Stick directions stay keyboard-only.',
-                       'Нажмите «Назначить…» в строке кнопки, чтобы привязать кнопку мыши '
-                       'вместо клавиши — левую, среднюю, правую или боковые (вперёд/назад), '
-                       'если они есть. Направления стиков можно привязать только к клавише.'))
+        self.note(f, _('Click "Set…" on any row to bind a mouse button, the wheel, or a held '
+                       'combo of inputs instead of a single key — left, middle, right, or the '
+                       'side buttons (back/forward), if the mouse has them. A combo saves when '
+                       'you release the inputs, and replaces the row\'s previous binding.',
+                       'Нажмите «Назначить…» в любой строке, чтобы привязать кнопку мыши, '
+                       'колесо или комбинацию удерживаемых вводов вместо одной клавиши — левую, '
+                       'среднюю, правую или боковые (вперёд/назад), если они есть. Комбинация '
+                       'сохранится, когда вы отпустите вводы, и заменит прежнюю привязку строки.'))
         self.note(f, _('Reserved: Insert/Escape (the port\'s menu), F9 (route recording), and '
                        'whichever key toggles mouse look or reloads input.ini (F7/F8 by '
-                       'default). A key or button already used elsewhere is simply bound to '
-                       'both actions (hold it to trigger both) — this page does not warn about '
-                       'that.',
+                       'default). A combo takes priority over the single-key actions sharing '
+                       'its keys: while "lshift,leftbutton" fires, "leftbutton" and "lshift" '
+                       'alone stay released for that press — like shadPS4.',
                        'Зарезервированы: Insert/Escape (меню порта), F9 (запись маршрута), а '
                        'также клавиши переключения мыши и перезагрузки input.ini (по умолчанию '
-                       'F7/F8). Если клавиша или кнопка уже где-то занята, она просто '
-                       'срабатывает на обе привязки — страница об этом не предупреждает.'))
+                       'F7/F8). Комбинация имеет приоритет над одиночными привязками с теми же '
+                       'клавишами: пока срабатывает «lshift,leftbutton», привязки «leftbutton» '
+                       'и «lshift» по отдельности в это нажатие выключены — как в shadPS4.'))
 
         self.section(f, _('Mouse look', 'Обзор мышью'))
         ms = self.mouse_settings
@@ -953,10 +956,6 @@ class Launcher:
                      'Добавляется поверх чувствительности; поднимает минимальную скорость для '
                      'медленных движений, почти не влияя на быстрые.'), 0.0, 1.0)
 
-        self.note(f, _('The scroll wheel is configured in input.ini directly (see docs/INPUT.md) '
-                       '— mouse buttons are bound from the Buttons section above.',
-                       'Колесо мыши настраивается напрямую в input.ini (см. docs/INPUT.md) — '
-                       'кнопки мыши назначаются в разделе «Кнопки» выше.'), top=10)
         self.note(f, _('Changes apply the next time the game starts, or press F8 in-game to '
                        'reload input.ini without restarting.',
                        'Изменения применяются при следующем запуске игры, либо нажмите F8 в '
@@ -971,45 +970,76 @@ class Launcher:
         self.refresh_remap_row(output)
 
     def start_remap_capture(self, output, key_label, set_btn):
-        """Grabs the next keypress or mouse click and binds it to `output`'s first slot. Esc
-        cancels; a key/button already reserved (HOT-001/HOT-002), or a mouse click on a
-        STICK_OUTPUTS row (an axis has no use for a press), is rejected in place, leaving the
-        previous binding untouched. bind_all (not root.bind) plus grab_set makes sure the event
-        reaches this handler even if some other widget currently has focus, and that no other
-        widget (e.g. the player-name Entry on another page) reacts to the same keypress.
-
-        The <ButtonPress> bind is installed via after_idle rather than immediately: this call
-        itself runs from the "Set…" button's own click handler, so the left-button-release that
-        follows (Tk doesn't fire <ButtonPress> again for that click, but belt-and-suspenders
-        against any platform quirk) would otherwise risk being seen as "the user chose
-        leftbutton" the instant capture starts."""
-        is_stick = output in STICK_OUTPUTS
+        """Grabs the next input, or a combo of up to 3 inputs, and binds it to `output`'s first
+        slot. Keys and mouse buttons accumulate while they are held and the binding is committed
+        when they are all released (hold Shift, click, release -> "lshift,leftbutton"); the wheel
+        commits immediately with whatever is held. Esc cancels; a reserved key (HOT-001/HOT-002)
+        rejects the whole combo in place, leaving the previous binding untouched. bind_all (not
+        root.bind) plus grab_set makes sure the input reaches this handler even if some other
+        widget currently has focus, and that no other widget (e.g. the player-name Entry on
+        another page) reacts to the same keypress. Mouse buttons/wheel map to the same names
+        input.ini uses (leftbutton, sidebuttonback, mousewheelup, ...); stick directions accept
+        them too, since the runtime lets a held button drive an axis at full deflection."""
         original_text = set_btn['text']
-        key_label.configure(text=_('Press a key or mouse button…', 'Нажмите клавишу или кнопку мыши…')
-                            if not is_stick else _('Press a key…', 'Нажмите клавишу…'))
+        key_label.configure(text=_('Press key(s)/mouse…', 'Нажмите клавиши/мышь…'))
         set_btn.configure(state='disabled')
         self.root.grab_set()
+        combo, held = [], set()
 
         def finish():
             self.root.unbind_all('<KeyPress>')
+            self.root.unbind_all('<KeyRelease>')
             self.root.unbind_all('<ButtonPress>')
+            self.root.unbind_all('<ButtonRelease>')
+            self.root.unbind('<MouseWheel>', wheel_id)
             self.root.grab_release()
             set_btn.configure(state='normal', text=original_text)
             self.refresh_remap_row(output)
 
-        def apply(name):
-            reserved = reserved_keys(self.remap_toggle_key, self.remap_reload_key)
-            if name in reserved:
+        def commit():
+            if len(combo) > 3:
                 self.messagebox.showwarning(
-                    _('Reserved', 'Зарезервировано'),
-                    _('{} is reserved (menu, recording, or a hotkey) and cannot be bound to a '
-                      'game action.', '{} зарезервирована (меню, запись или горячая клавиша) и '
-                      'не может быть назначена игровому действию.').format(name))
-            else:
-                self.remap_edits[output] = name
+                    _('Too many inputs', 'Слишком много вводов'),
+                    _('At most 3 inputs can be combined; nothing was bound.',
+                      'В комбинации может быть максимум 3 ввода; ничего не назначено.'))
+            elif combo:
+                reserved = reserved_keys(self.remap_toggle_key, self.remap_reload_key)
+                bad = [name for name in combo if name in reserved]
+                if bad:
+                    self.messagebox.showwarning(
+                        _('Reserved key', 'Зарезервированная клавиша'),
+                        _('{} is reserved (menu, recording, or a hotkey) and cannot be bound to a '
+                          'game action.', '{} зарезервирована (меню, запись или горячая клавиша) и '
+                          'не может быть назначена игровому действию.').format(', '.join(bad)))
+                else:
+                    self.remap_edits[output] = ','.join(combo)
             finish()
 
-        def on_key(event):
+        def add(name):
+            if name not in combo:
+                combo.append(name)
+            key_label.configure(text=','.join(combo))
+
+        def seed_modifiers(state):
+            # Tk's state bits 0x1 = Shift, 0x4 = Control (same on Windows Tk). Seeded into the
+            # combo but not into `held`: a modifier already down when the capture started (Shift
+            # held while "Set…" was clicked) never sends a KeyPress or a release this handler
+            # sees, and waiting for that release would leave the capture stuck. Holding Shift and
+            # clicking then binds "lshift,leftbutton" whichever order they were pressed in.
+            if state & 0x1:
+                add('lshift')
+            if state & 0x4:
+                add('lctrl')
+
+        def release(name):
+            held.discard(name)
+            # An empty combo must not end the capture: the click that armed it can leave a stray
+            # release behind, and a capture that stops before the player pressed anything would
+            # just be confusing.
+            if not held and combo:
+                commit()
+
+        def on_key_press(event):
             if event.keysym == 'Escape':
                 finish()
                 return
@@ -1020,23 +1050,42 @@ class Launcher:
                     _('That key has no bbport name; pick another one.',
                       'У этой клавиши нет имени в bbport; выберите другую.'))
                 return
-            apply(name)
+            seed_modifiers(event.state)
+            held.add(name)
+            add(name)
 
-        def on_click(event):
+        def on_key_release(event):
+            name = keysym_to_name(event.keysym)
+            if name:
+                release(name)
+
+        def on_button_press(event):
             name = button_num_to_name(event.num)
             if name is None:
                 return  # a button Tk reports but bbport has no name for: ignore, keep waiting
-            if is_stick:
-                self.messagebox.showwarning(
-                    _('Keyboard only', 'Только клавиатура'),
-                    _('A stick direction can only be bound to a key, not a mouse button.',
-                      'Направление стика можно привязать только к клавише, а не к кнопке мыши.'))
-                return
-            apply(name)
+            seed_modifiers(event.state)
+            held.add(name)
+            add(name)
 
-        self.root.bind_all('<KeyPress>', on_key)
-        if not is_stick:
-            self.root.after_idle(lambda: self.root.bind_all('<ButtonPress>', on_click))
+        def on_button_release(event):
+            name = button_num_to_name(event.num)
+            if name:
+                release(name)
+
+        def on_wheel(event):
+            # The wheel cannot be held, so it commits right away with whatever is held. 'break'
+            # keeps the page from scrolling while the direction is being assigned.
+            seed_modifiers(event.state)
+            add('mousewheelup' if event.delta > 0 else 'mousewheeldown')
+            commit()
+            return 'break'
+
+        self.root.bind_all('<KeyPress>', on_key_press)
+        self.root.bind_all('<KeyRelease>', on_key_release)
+        self.root.bind_all('<ButtonPress>', on_button_press)
+        self.root.bind_all('<ButtonRelease>', on_button_release)
+        # add='+': the app-wide page scrolling is bound to <MouseWheel> too (wheel() above).
+        wheel_id = self.root.bind('<MouseWheel>', on_wheel, add='+')
 
     def build_advanced(self):
         ttk = self.ttk
